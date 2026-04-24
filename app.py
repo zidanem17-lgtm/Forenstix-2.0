@@ -21,6 +21,7 @@ New in v2.0:
 All v1 endpoints are fully preserved.
 """
 
+import logging
 import os
 import json
 import datetime
@@ -39,6 +40,8 @@ from pivot import run_pivot, stream_pivot, IOC_TOOL_MAP
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024
 app.config["UPLOAD_FOLDER"] = tempfile.mkdtemp()
+
+_log = logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -75,13 +78,11 @@ def analyze():
             "report_html": report_html,
         })
     except Exception as e:
-        return jsonify({"error": f"Analysis failed: {str(e)}"}), 500
+        _log.exception("analyze: %s", e)
+        return jsonify({"error": "Analysis failed. Check server logs for details."}), 500
     finally:
         if os.path.exists(filepath):
             os.remove(filepath)
-
-
-@app.route("/analyze-batch", methods=["POST"])
 def analyze_batch():
     files = request.files.getlist("files")
     if not files or all(f.filename == "" for f in files):
@@ -110,9 +111,10 @@ def analyze_batch():
                     "status": "success",
                 })
             except Exception as e:
+                _log.exception("batch item %s: %s", file.filename, e)
                 results_list.append({
                     "results": {"metadata": {"filename": file.filename}},
-                    "error": str(e),
+                    "error": "Analysis failed",
                     "status": "error",
                 })
         return jsonify({
@@ -122,7 +124,8 @@ def analyze_batch():
             "failed": sum(1 for r in results_list if r["status"] == "error"),
         })
     except Exception as e:
-        return jsonify({"error": f"Batch analysis failed: {str(e)}"}), 500
+        _log.exception("analyze_batch: %s", e)
+        return jsonify({"error": "Batch analysis failed. Check server logs for details."}), 500
     finally:
         for path in saved_paths:
             if os.path.exists(path):
@@ -164,7 +167,8 @@ def compare():
             "narrative_html": narrative_html,
         })
     except Exception as e:
-        return jsonify({"error": f"Comparison failed: {str(e)}"}), 500
+        _log.exception("compare: %s", e)
+        return jsonify({"error": "Comparison failed. Check server logs for details."}), 500
     finally:
         for path in saved_paths:
             if os.path.exists(path):
@@ -224,7 +228,8 @@ def export_pdf():
                              download_name=f"FORENSTIX_Report_{filename}.html",
                              mimetype="text/html")
     except Exception as e:
-        return jsonify({"error": f"Export failed: {str(e)}"}), 500
+        _log.exception("export_pdf: %s", e)
+        return jsonify({"error": "Export failed. Check server logs for details."}), 500
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -362,7 +367,8 @@ def create_case():
         case = db.create_case(name, body.get("description", ""))
         return jsonify(case), 201
     except Exception as e:
-        return jsonify({"error": str(e)}), 409
+        _log.exception("create_case: %s", e)
+        return jsonify({"error": "Could not create case. Name may already exist."}), 409
 
 
 @app.route("/cases/<int:case_id>", methods=["GET"])
@@ -411,7 +417,8 @@ def add_case_file(case_id):
         case_file = db.add_file_to_case(case_id, analysis)
         return jsonify(case_file), 201
     except Exception as e:
-        return jsonify({"error": f"Failed to add file: {str(e)}"}), 500
+        _log.exception("add_case_file: case=%s %s", case_id, e)
+        return jsonify({"error": "Failed to add file to case. Check server logs for details."}), 500
     finally:
         if os.path.exists(filepath):
             os.remove(filepath)
@@ -545,4 +552,5 @@ def _generate_comparison_narrative(comparison: dict) -> str:
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    debug = os.environ.get("FLASK_DEBUG", "0").lower() in ("1", "true", "yes")
+    app.run(host="0.0.0.0", port=port, debug=debug)

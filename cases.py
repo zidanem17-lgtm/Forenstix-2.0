@@ -149,16 +149,21 @@ def list_cases(status: Optional[str] = None) -> List[Dict]:
 
 
 def update_case(case_id: int, **kwargs) -> Optional[Dict]:
-    allowed = {"name", "description", "status"}
-    updates = {k: v for k, v in kwargs.items() if k in allowed}
+    # Hardcoded column map — never interpolate user-supplied key names into SQL
+    _UPDATABLE = {"name": "name", "description": "description", "status": "status"}
+    updates: Dict[str, Any] = {}
+    for field, col in _UPDATABLE.items():
+        if field in kwargs:
+            updates[col] = kwargs[field]
     if not updates:
         return get_case(case_id)
     updates["updated_at"] = _now()
-    cols = ", ".join(f"{k} = ?" for k in updates)
+    # Build SET clause from the fixed column names above (never from user input)
+    set_clause = ", ".join(f"{col} = ?" for col in updates)
     vals = list(updates.values()) + [case_id]
     with _lock:
         conn = _connect()
-        conn.execute(f"UPDATE cases SET {cols} WHERE id = ?", vals)
+        conn.execute(f"UPDATE cases SET {set_clause} WHERE id = ?", vals)
         conn.commit()
         conn.close()
     return get_case(case_id)
