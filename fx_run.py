@@ -30,6 +30,7 @@ import argparse
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -103,24 +104,53 @@ def _audit(result: Dict) -> None:
 
 # ─── Execution ────────────────────────────────────────────────────────────
 
-def _run_native(cmd: str, timeout: int) -> tuple[int, str, str]:
+def _docker_image_available(image: str) -> bool:
+    """Return True only if a Docker image is already present locally."""
     try:
-        r = subprocess.run(
+        result = subprocess.run(
+            ["docker", "image", "inspect", image],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def _run_native(cmd: str, timeout: int) -> tuple[int, str, str]:
+    """Run a shell command, killing the whole process group on timeout."""
+    import os
+    import signal
+    try:
+        proc = subprocess.Popen(
             ["bash", "-lc", cmd],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=timeout,
+            start_new_session=True,   # own process group → clean kill
         )
-        return r.returncode, r.stdout.decode(errors="replace"), r.stderr.decode(errors="replace")
-    except subprocess.TimeoutExpired:
-        return -1, "", f"Timed out after {timeout}s"
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+            return (
+                proc.returncode,
+                stdout.decode(errors="replace"),
+                stderr.decode(errors="replace"),
+            )
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except Exception:
+                proc.kill()
+            proc.communicate()
+            return (-1, "", f"Timed out after {timeout}s")
     except Exception as e:
         return -1, "", str(e)
 
 
-def _run_docker(image: str, args: str, timeout: int) -> tuple[int, str, str]:
-    cmd = f"docker run --rm --network host {image} {args}"
-    return _run_native(cmd, timeout + 30)
+def _run_docker(image: str, tool_args: str, timeout: int) -> tuple[int, str, str]:
+    """Run a pre-pulled Docker image with the given args. Never pulls."""
+    cmd = f"docker run --rm --pull never --network host {shlex.quote(image)} {tool_args}"
+    return _run_native(cmd, timeout)
 
 
 def run_tool(
@@ -159,10 +189,10 @@ def run_tool(
     backend = env.backend
     start = time.monotonic()
 
-    if env.docker_available and tool.docker_image:
+    if env.docker_available and tool.docker_image and _docker_image_available(tool.docker_image):
         binary = cmd_str.split()[0]
-        args = cmd_str[len(binary):].strip()
-        rc, stdout, stderr = _run_docker(tool.docker_image, args, timeout)
+        tool_args = cmd_str[len(binary):].strip()
+        rc, stdout, stderr = _run_docker(tool.docker_image, tool_args, timeout)
         backend = "docker"
     else:
         rc, stdout, stderr = _run_native(cmd_str, timeout)

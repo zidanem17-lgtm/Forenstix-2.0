@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import threading
@@ -75,8 +76,22 @@ def _build_cmd(tool_id: str, target: str) -> Optional[str]:
     return None
 
 
+def _docker_image_available(image: str) -> bool:
+    """Return True only if a Docker image is already present locally."""
+    try:
+        result = subprocess.run(
+            ["docker", "image", "inspect", image],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
 def _tool_available(tool_id: str, env=None) -> bool:
-    """Check if a tool binary/docker-image is available."""
+    """Check if a tool binary or locally-cached Docker image is available."""
     if env is None:
         env = detect_env()
 
@@ -85,39 +100,52 @@ def _tool_available(tool_id: str, env=None) -> bool:
     if not tool:
         return False
 
-    if env.docker_available and tool.docker_image:
-        return True
-
-    # Check for the binary name (first word of run_cmd)
+    # Check native binary first (fast path)
     run_cmd = PIVOT_CMD_OVERRIDES.get(tool_id, tool.run_cmd)
     binary = run_cmd.split()[0]
-    return shutil.which(binary) is not None
+    if shutil.which(binary) is not None:
+        return True
+
+    # Docker fallback — only if image is already pulled locally
+    if env.docker_available and tool.docker_image:
+        return _docker_image_available(tool.docker_image)
+
+    return False
 
 
 def _run_native(cmd: str, timeout: int) -> tuple[int, str, str]:
-    """Run a command natively and return (returncode, stdout, stderr)."""
+    """Run a shell command, killing the whole process group on timeout."""
+    import os
+    import signal
     try:
-        result = subprocess.run(
+        proc = subprocess.Popen(
             ["bash", "-lc", cmd],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=timeout,
+            start_new_session=True,   # own process group → clean kill
         )
-        return (
-            result.returncode,
-            result.stdout.decode(errors="replace"),
-            result.stderr.decode(errors="replace"),
-        )
-    except subprocess.TimeoutExpired:
-        return (-1, "", f"Tool timed out after {timeout}s")
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+            return (
+                proc.returncode,
+                stdout.decode(errors="replace"),
+                stderr.decode(errors="replace"),
+            )
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except Exception:
+                proc.kill()
+            proc.communicate()
+            return (-1, "", f"Tool timed out after {timeout}s")
     except Exception as e:
         return (-1, "", str(e))
 
 
-def _run_docker(image: str, cmd: str, timeout: int) -> tuple[int, str, str]:
-    """Run a command in Docker."""
-    docker_cmd = f"docker run --rm --network host {image} {cmd}"
-    return _run_native(docker_cmd, timeout + 30)
+def _run_docker(image: str, tool_args: str, timeout: int) -> tuple[int, str, str]:
+    """Run a pre-pulled Docker image with the given args. Never pulls."""
+    docker_cmd = f"docker run --rm --pull never --network host {shlex.quote(image)} {tool_args}"
+    return _run_native(docker_cmd, timeout)
 
 
 def run_tool(
@@ -144,10 +172,10 @@ def run_tool(
     start = time.monotonic()
     backend = env.backend
 
-    if env.docker_available and tool.docker_image:
-        # Use purpose-built Docker image
-        # Build args: strip the binary prefix from cmd_str
+    if env.docker_available and tool.docker_image and _docker_image_available(tool.docker_image):
+        # Use locally-available Docker image; pass only the args (not the binary prefix)
         img = tool.docker_image
+        # cmd_str is like "subfinder -silent -d example.com"; Docker ENTRYPOINT is the binary
         binary = cmd_str.split()[0]
         args = cmd_str[len(binary):].strip()
         rc, stdout, stderr = _run_docker(img, args, timeout)
